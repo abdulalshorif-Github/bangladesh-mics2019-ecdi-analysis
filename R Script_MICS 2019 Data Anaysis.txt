@@ -1,0 +1,1199 @@
+# ============================================================
+# BANGLADESH MICS 2019 — Survey-weighted generalized ANCOVA
+# Outcome: ECDI_TRACK (0 = not on track, 1 = on track)
+# Model 0: ecoli + arsenic
+# Model 1: + age + sex
+# Model 2: + mother's education + wealth + area + division
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(survey)
+
+options(survey.lonely.psu = "adjust")
+
+# ---- 1. Load data -------------------------------------------------
+file_path <- "mics_ecdi_dataset_v4.xlsx"
+if (!file.exists(file_path)) file_path <- file.choose()
+mics <- read_excel(file_path, sheet = "ECDI_922")
+
+to_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+# ---- 2. Recode variables ------------------------------------------
+analysis_data <- mics %>%
+  transmute(
+    PSU            = factor(PSU),
+    STRATUM        = factor(STRATUM),
+    survey_weight  = to_numeric(WEIGHT),                 # child/ECDI weight
+    ECDI_TRACK     = to_numeric(ECDI_TRACK),
+    ecoli          = factor(to_numeric(HH_DW_ECOLI), levels = c(0, 1),
+                            labels = c("Not detected", "Detected")),
+    arsenic        = factor(to_numeric(hh_arsenic_gt10), levels = c(0, 1),
+                            labels = c("10 ppb or less", "Above 10 ppb")),
+    AGE_M          = to_numeric(AGE_M),
+    AGE_M_CENTERED = AGE_M - 48,                          # centered at 48 months
+    sex            = factor(to_numeric(SEX), levels = c(1, 2),
+                            labels = c("Male", "Female")),
+    mother_edu     = factor(to_numeric(MOTHER_EDU), levels = 0:3,
+                            labels = c("Pre-primary or none", "Primary",
+                                       "Secondary", "Higher secondary+")),
+    wealth_score   = to_numeric(HH_WEALTH_SCORE),
+    area           = factor(to_numeric(AREA), levels = c(1, 2),
+                            labels = c("Urban", "Rural")),
+    division       = factor(to_numeric(DIVISION),
+                            levels = c(10, 20, 30, 40, 45, 50, 55, 60),
+                            labels = c("Barishal", "Chattogram", "Dhaka",
+                                       "Khulna", "Mymensingh", "Rajshahi",
+                                       "Rangpur", "Sylhet"))
+  ) %>%
+  filter(AGE_M >= 36, AGE_M <= 59) %>%                    # official ECDI age range
+  filter(complete.cases(.), survey_weight > 0, ECDI_TRACK %in% c(0, 1))
+
+cat("Final analytical sample:", nrow(analysis_data), "children\n")
+stopifnot(all(unique(analysis_data$ECDI_TRACK) %in% c(0, 1)),
+          length(unique(analysis_data$ECDI_TRACK)) == 2)
+
+# ---- 3. Survey design ----------------------------------------------
+mics_design <- svydesign(ids = ~PSU, strata = ~STRATUM,
+                         weights = ~survey_weight, data = analysis_data,
+                         nest = TRUE)
+
+# ---- 4. Models -------------------------------------------------------
+model0 <- svyglm(ECDI_TRACK ~ ecoli + arsenic,
+                 design = mics_design, family = quasibinomial())
+
+model1 <- svyglm(ECDI_TRACK ~ ecoli + arsenic + AGE_M + sex,
+                 design = mics_design, family = quasibinomial())
+
+model2 <- svyglm(ECDI_TRACK ~ ecoli + arsenic + AGE_M + sex +
+                   mother_edu + wealth_score + area + division,
+                 design = mics_design, family = quasibinomial())
+
+model3 <- svyglm(ECDI_TRACK ~ ecoli * arsenic + AGE_M + sex +
+                   mother_edu + wealth_score + area + division,
+                 design = mics_design, family = quasibinomial())
+
+# ---- 5. Odds-ratio table helper --------------------------------------
+or_table <- function(model, name) {
+  b <- coef(summary(model))
+  ci <- confint(model)
+  data.frame(Model = name, Variable = rownames(b),
+             Beta = round(b[, "Estimate"], 3),
+             Adjusted_OR = round(exp(b[, "Estimate"]), 3),
+             CI_95_Lower = round(exp(ci[, 1]), 3),
+             CI_95_Upper = round(exp(ci[, 2]), 3),
+             P_value = ifelse(b[, ncol(b)] < 0.001, "<0.001",
+                              sprintf("%.3f", b[, ncol(b)])),
+             row.names = NULL) %>%
+    filter(Variable != "(Intercept)")
+}
+
+results <- bind_rows(
+  or_table(model0, "Model 0"),
+  or_table(model1, "Model 1"),
+  or_table(model2, "Model 2"),
+  or_table(model3, "Model 3 (interaction)")
+)
+
+cat("\n=== Odds ratios, all models ===\n"); print(results)
+
+# Is the interaction itself significant? This is the real test of
+# whether arsenic and E. coli combine synergistically/additively.
+cat("\n=== Model 3: arsenic x E. coli interaction test ===\n")
+print(regTermTest(model3, ~ecoli:arsenic))
+
+# ---- 6. Overall (design-based) significance tests for Model 2 --------
+cat("\n=== Model 2: overall Wald tests per variable ===\n")
+for (v in c("ecoli", "arsenic", "AGE_M", "sex",
+            "mother_edu", "wealth_score", "area", "division")) {
+  cat("\n", v, ":\n", sep = "")
+  print(regTermTest(model2, as.formula(paste0("~", v))))
+}
+
+# ---- 7. Does adding covariates improve the model? ---------------------
+cat("\n=== Model comparisons (nested Wald tests) ===\n")
+cat("\nModel 0 vs 1:\n"); print(anova(model0, model1, method = "Wald"))
+cat("\nModel 1 vs 2:\n"); print(anova(model1, model2, method = "Wald"))
+cat("\nModel 2 vs 3 (does the interaction improve fit):\n")
+print(anova(model2, model3, method = "Wald"))
+
+# ---- 8. Linearity checks (age, wealth) ---------------------------------
+model2_age_sq <- update(model2, . ~ . + I(AGE_M^2))
+model2_wealth_sq <- update(model2, . ~ . + I(wealth_score^2))
+cat("\n=== Linearity checks ===\n")
+cat("Age (quadratic term):\n")
+print(regTermTest(model2_age_sq, ~I(AGE_M^2)))
+cat("Wealth (quadratic term):\n")
+print(regTermTest(model2_wealth_sq, ~I(wealth_score^2)))
+
+# ---- 9. Save outputs -----------------------------------------------------
+write.csv(results, "all_models_odds_ratios_updated.csv", row.names = FALSE)
+
+cat("\nDone. Saved: all_models_odds_ratios_updated.csv\n")
+
+
+
+
+
+
+# ---- Joint model analysis ---------------------------------
+
+analysis_data %>%
+  count(ecoli, arsenic)
+
+svytable(~ecoli + arsenic, design = mics_design)
+prop.table(svytable(~ecoli + arsenic, design = mics_design))
+
+analysis_data <- analysis_data %>%
+  mutate(
+    joint_exposure = factor(
+      case_when(
+        ecoli == "Not detected" & arsenic == "10 ppb or less" ~ 0,
+        ecoli == "Detected" & arsenic == "10 ppb or less" ~ 1,
+        ecoli == "Not detected" & arsenic == "Above 10 ppb" ~ 2,
+        ecoli == "Detected" & arsenic == "Above 10 ppb" ~ 3
+      ),
+      levels = 0:3,
+      labels = c(
+        "Neither exposure",
+        "E. coli only",
+        "Arsenic only",
+        "Both exposures"
+      )
+    )
+  )
+
+mics_design <- update(
+  mics_design,
+  joint_exposure = analysis_data$joint_exposure
+)
+
+joint_model <- svyglm(
+  ECDI_TRACK ~ joint_exposure + AGE_M + sex +
+    mother_edu + wealth_score + area + division,
+  design = mics_design,
+  family = quasibinomial()
+)
+
+print(joint_model)
+summary(joint_model)
+
+
+
+#------------------------------------------------------
+# ============================================================
+# BANGLADESH MICS 2019 — Survey-weighted generalized ANCOVA
+# Fits the SAME Model 0/1/2/3 sequence across FOUR ECDI sub-domains:
+#   ECDI_LNS    = Literacy-numeracy
+#   ECDI_PHY    = Physical development
+#   ECDI_SEL    = Social-emotional development
+#   ECDI_LEARN  = Approaches to learning
+# (Same logic as the ECDI_TRACK script — just looped across outcomes)
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(survey)
+
+options(survey.lonely.psu = "adjust")
+
+# ---- 1. Load data -------------------------------------------------
+file_path <- "mics_ecdi_dataset_v4.xlsx"
+if (!file.exists(file_path)) file_path <- file.choose()
+mics <- read_excel(file_path, sheet = "ECDI_922")
+
+to_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+# ---- 2. Recode variables -------------------------------------------
+analysis_data <- mics %>%
+  transmute(
+    PSU            = factor(PSU),
+    STRATUM        = factor(STRATUM),
+    survey_weight  = to_numeric(WEIGHT),
+    
+    ECDI_LNS       = to_numeric(ECDI_LNS),
+    ECDI_PHY       = to_numeric(ECDI_PHY),
+    ECDI_SEL       = to_numeric(ECDI_SEL),
+    ECDI_LEARN     = to_numeric(ECDI_LEARN),
+    
+    ecoli          = factor(to_numeric(HH_DW_ECOLI), levels = c(0, 1),
+                            labels = c("Not detected", "Detected")),
+    arsenic        = factor(to_numeric(hh_arsenic_gt10), levels = c(0, 1),
+                            labels = c("10 ppb or less", "Above 10 ppb")),
+    
+    AGE_M          = to_numeric(AGE_M),
+    AGE_M_CENTERED = AGE_M - 48,
+    
+    sex            = factor(to_numeric(SEX), levels = c(1, 2),
+                            labels = c("Male", "Female")),
+    mother_edu     = factor(to_numeric(MOTHER_EDU), levels = 0:3,
+                            labels = c("Pre-primary or none", "Primary",
+                                       "Secondary", "Higher secondary+")),
+    wealth_score   = to_numeric(HH_WEALTH_SCORE),
+    area           = factor(to_numeric(AREA), levels = c(1, 2),
+                            labels = c("Urban", "Rural")),
+    division       = factor(to_numeric(DIVISION),
+                            levels = c(10, 20, 30, 40, 45, 50, 55, 60),
+                            labels = c("Barishal", "Chattogram", "Dhaka",
+                                       "Khulna", "Mymensingh", "Rajshahi",
+                                       "Rangpur", "Sylhet"))
+  ) %>%
+  filter(AGE_M >= 36, AGE_M <= 59) %>%
+  filter(complete.cases(.), survey_weight > 0)
+
+cat("Final analytical sample:", nrow(analysis_data), "children\n")
+
+# Quick check: how rare is each sub-domain's "not on track" category?
+cat("\nOutcome prevalence (0 = not on track):\n")
+for (v in c("ECDI_LNS", "ECDI_PHY", "ECDI_SEL", "ECDI_LEARN")) {
+  cat(v, ": "); print(table(analysis_data[[v]]))
+}
+
+# ---- 3. Survey design ------------------------------------------------
+mics_design <- svydesign(ids = ~PSU, strata = ~STRATUM,
+                         weights = ~survey_weight, data = analysis_data,
+                         nest = TRUE)
+
+# ---- 4. Odds-ratio table helper ---------------------------------------
+or_table <- function(model, model_name, domain) {
+  b <- coef(summary(model))
+  ci <- confint(model)
+  data.frame(Domain = domain, Model = model_name, Variable = rownames(b),
+             Beta = round(b[, "Estimate"], 3),
+             Adjusted_OR = round(exp(b[, "Estimate"]), 3),
+             CI_95_Lower = round(exp(ci[, 1]), 3),
+             CI_95_Upper = round(exp(ci[, 2]), 3),
+             P_value = ifelse(b[, ncol(b)] < 0.001, "<0.001",
+                              sprintf("%.3f", b[, ncol(b)])),
+             row.names = NULL) %>%
+    filter(Variable != "(Intercept)")
+}
+
+# ---- 5. Separation checks --------------------------------------------
+# A categorical covariate causes "separation" if any of its levels has
+# ZERO children in one outcome category (e.g. a division with 0 "not on
+# track" children). Fitting logistic regression on such data produces
+# fake extreme estimates (huge betas, OR near 0 or in the millions,
+# CI = [0,0] or absurdly wide) rather than a real effect. This checks
+# for that automatically and drops the offending ADJUSTMENT covariate
+# (not the exposures) before fitting Model 2/3.
+has_zero_cell <- function(data, outcome, var) {
+  tab <- table(data[[var]], data[[outcome]])
+  any(tab == 0)
+}
+
+# The arsenic x E. coli interaction needs its own check: all four
+# combinations of (ecoli, arsenic) must contain BOTH outcome values,
+# or the interaction term is not estimable.
+interaction_estimable <- function(data, outcome) {
+  tab <- table(data$ecoli, data$arsenic, data[[outcome]])
+  !any(apply(tab, c(1, 2), function(x) any(x == 0)))
+}
+
+# ---- 6. Function: fit Models 0-3 for one outcome variable --------------
+fit_domain_models <- function(outcome, data, design) {
+  
+  adjustment_vars <- c("sex", "mother_edu", "area", "division")  # wealth_score
+  # is continuous, so it can't cause this kind of zero-cell separation
+  
+  zero_cell_vars <- adjustment_vars[sapply(adjustment_vars, has_zero_cell,
+                                           data = data, outcome = outcome)]
+  covars_safe <- setdiff(adjustment_vars, zero_cell_vars)
+  # sex and AGE_M_CENTERED are kept in every model; only mother_edu/area/
+  # division (plus wealth_score) get added conditionally in Model 2/3
+  extra_covars <- setdiff(covars_safe, "sex")
+  extra_str <- paste(c(extra_covars, "wealth_score"), collapse = " + ")
+  
+  if (length(zero_cell_vars) > 0) {
+    cat("  [", outcome, "] dropped from Model 2/3 (zero-cell separation): ",
+        paste(zero_cell_vars, collapse = ", "), "\n", sep = "")
+  }
+  
+  sex_ok <- !("sex" %in% zero_cell_vars)   # sex is very unlikely to separate,
+  sex_term <- if (sex_ok) "+ sex" else ""  # but checked for completeness
+  
+  f0 <- as.formula(paste(outcome, "~ ecoli + arsenic"))
+  f1 <- as.formula(paste(outcome, "~ ecoli + arsenic + AGE_M", sex_term))
+  f2 <- as.formula(paste(outcome, "~ ecoli + arsenic + AGE_M", sex_term,
+                         "+", extra_str))
+  
+  m0 <- svyglm(f0, design = design, family = quasibinomial())
+  m1 <- svyglm(f1, design = design, family = quasibinomial())
+  m2 <- svyglm(f2, design = design, family = quasibinomial())
+  
+  if (interaction_estimable(data, outcome)) {
+    f3 <- as.formula(paste(outcome, "~ ecoli * arsenic + AGE_M_CENTERED", sex_term,
+                           "+", extra_str))
+    m3 <- svyglm(f3, design = design, family = quasibinomial())
+    interaction_test <- regTermTest(m3, ~ecoli:arsenic)
+    m3_results <- or_table(m3, "Model 3 (interaction)", outcome)
+  } else {
+    cat("  [", outcome, "] Model 3 (interaction) SKIPPED: not estimable ",
+        "(a ecoli x arsenic combination has zero children in one outcome ",
+        "category)\n", sep = "")
+    m3 <- NULL
+    interaction_test <- NULL
+    m3_results <- NULL
+  }
+  
+  list(
+    models = list(model0 = m0, model1 = m1, model2 = m2, model3 = m3),
+    dropped_covariates = zero_cell_vars,
+    results = bind_rows(
+      or_table(m0, "Model 0", outcome),
+      or_table(m1, "Model 1", outcome),
+      or_table(m2, "Model 2", outcome),
+      m3_results
+    ),
+    interaction_test = interaction_test
+  )
+}
+
+# ---- 7. Run for all four ECDI sub-domains -------------------------------
+domains <- c("ECDI_LNS", "ECDI_PHY", "ECDI_SEL", "ECDI_LEARN")
+cat("\n=== Checking for separation issues before fitting ===\n")
+domain_fits <- lapply(domains, fit_domain_models, data = analysis_data,
+                      design = mics_design)
+names(domain_fits) <- domains
+
+# ---- 8. Combine results across all domains -------------------------------
+all_results <- bind_rows(lapply(domain_fits, function(x) x$results))
+
+cat("\n=== Odds ratios: all domains, all models ===\n")
+print(all_results)
+
+# ---- 9. Interaction test summary, one line per domain ---------------------
+cat("\n=== Arsenic x E. coli interaction test, by domain ===\n")
+for (d in domains) {
+  cat("\n", d, ":\n", sep = "")
+  if (is.null(domain_fits[[d]]$interaction_test)) {
+    cat("Not estimable (zero-cell in interaction table) — see console warning above.\n")
+  } else {
+    print(domain_fits[[d]]$interaction_test)
+  }
+}
+
+# ---- 10. Save outputs -------------------------------------------------------
+write.csv(all_results, "ecdi_subdomains_odds_ratios.csv", row.names = FALSE)
+
+
+# ---- 11. Summary of what was automatically dropped, for your writeup --------
+cat("\n=== Separation-handling summary (report this in your methods/limitations) ===\n")
+for (d in domains) {
+  dropped <- domain_fits[[d]]$dropped_covariates
+  interaction_ok <- !is.null(domain_fits[[d]]$interaction_test)
+  cat("\n", d, ":\n", sep = "")
+  cat("  Covariates dropped from Model 2/3 due to zero-cell separation: ",
+      if (length(dropped) == 0) "none" else paste(dropped, collapse = ", "), "\n", sep = "")
+  cat("  Model 3 (interaction) estimable: ", interaction_ok, "\n", sep = "")
+}
+
+cat("\nNote: ECDI_PHY has only 15/922 children 'not on track' overall — even\n")
+cat("with problem covariates dropped, its remaining estimates have wide CIs\n")
+cat("and should be interpreted cautiously due to the rare outcome.\n")
+
+
+
+
+
+
+## =============================================================================
+## Gap 3: Does stunting mediate the E. coli -> ECDI relationship?
+## Bangladesh MICS 2019
+##
+## Causal chain under test:
+##      HH_DW_ECOLI (E. coli contamination, X)
+##            |
+##            v
+##      Stunting / HAZ  (mediator, M)
+##            |
+##            v
+##      ECDI_TRACK  (developmentally on-track, Y)
+##
+## Two parallel mediator specifications are tested, as recommended by the
+## supervisor's framework:
+##   (A) Binary mediator  : stunted (HAZ < -2 SD)      -> logistic mediator model
+##   (B) Continuous mediator: Z_SCORE_HEIGHT (HAZ)      -> linear mediator model
+##
+## Design notes:
+##   - MICS 2019 is a stratified, clustered, weighted survey (PSU, STRATUM, WEIGHT).
+##   - The `mediation` package's mediate() does NOT accept svyglm objects directly,
+##     so weighted glm()/lm() models are fit with `weights = WEIGHT`, and cluster-
+##     robust inference is obtained via mediate(..., boot = TRUE, cluster = PSU).
+##     NOTE: boot = TRUE is REQUIRED for the cluster argument to take effect --
+##     boot = FALSE silently ignores clustering.
+## =============================================================================
+
+## ---- 0. Setup ---------------------------------------------------------------
+required_pkgs <- c("readxl", "survey", "mediation", "dplyr", "boot", "car")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs) > 0) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+
+library(readxl)
+library(survey)
+library(mediation)
+library(dplyr)
+library(car)   # for vif()
+library(multimediate)
+
+set.seed(20260818)  # reproducibility for bootstrap
+
+dir.create("mediation_results/plots", recursive = TRUE, showWarnings = FALSE)
+
+## ---- 1. Load & prepare data --------------------------------------------------
+df <- read_excel("mics_ecdi_dataset_v4.xlsx")
+
+df <- df %>%
+  mutate(
+    # Exposure
+    ecoli        = as.numeric(HH_DW_ECOLI),          # 1 = contaminated, 0 = not
+    
+    # Mediators
+    stunted      = as.numeric(Z_SCORE_HEIGHT < -2),   # binary stunting indicator
+    haz          = as.numeric(Z_SCORE_HEIGHT),        # continuous HAZ
+    
+    # Outcome
+    ecdi_track   = as.numeric(ECDI_TRACK),
+    
+    # Covariates
+    age_c        = as.numeric(AGE_M) - 48,            # age centered at 48 months
+    sex_f        = factor(SEX),                       # 1 = male, 2 = female
+    
+    # Design variables
+    psu          = as.factor(PSU),
+    stratum      = as.factor(STRATUM),
+    wt           = as.numeric(WEIGHT)
+  )
+
+## Complete-case restriction on analysis variables (per memory: no missingness
+## expected on these fields, but this guards against future data refreshes)
+analysis_vars <- c("ecoli", "stunted", "haz", "ecdi_track", "age_c", "sex_f",
+                   "psu", "stratum", "wt")
+df_cc <- df[complete.cases(df[, analysis_vars]), ]
+
+cat("Analytic sample size:", nrow(df_cc), "of", nrow(df), "\n")
+cat("E. coli contaminated:", sum(df_cc$ecoli), " (",
+    round(100 * mean(df_cc$ecoli), 1), "%)\n")
+cat("Stunted (HAZ < -2):", sum(df_cc$stunted), " (",
+    round(100 * mean(df_cc$stunted), 1), "%)\n")
+cat("ECDI on-track:", sum(df_cc$ecdi_track), " (",
+    round(100 * mean(df_cc$ecdi_track), 1), "%)\n\n")
+
+## ---- 2. Zero-cell / separation check -----------------------------------------
+## Guards against the same complete-separation issue documented for ECDI_PHY
+## in the Gap 2 analysis before fitting any binomial model.
+has_zero_cell <- function(exposure, outcome) {
+  tab <- table(exposure, outcome)
+  any(tab == 0)
+}
+
+cat("Zero-cell check (ecoli x stunted):", has_zero_cell(df_cc$ecoli, df_cc$stunted), "\n")
+cat("Zero-cell check (ecoli x ecdi_track):", has_zero_cell(df_cc$ecoli, df_cc$ecdi_track), "\n")
+cat("Zero-cell check (stunted x ecdi_track):", has_zero_cell(df_cc$stunted, df_cc$ecdi_track), "\n\n")
+
+## =============================================================================
+## PATHWAY A: Binary mediator (stunted)
+## =============================================================================
+
+cat("=== PATHWAY A: E. coli -> Stunted (binary) -> ECDI ===\n\n")
+
+## Mediator model: P(stunted) ~ E. coli + covariates
+model_m_binary <- glm(
+  stunted ~ ecoli + age_c + sex_f,
+  family  = binomial(link = "logit"),
+  weights = wt,
+  data    = df_cc
+)
+
+## Outcome model: P(ECDI on track) ~ E. coli + stunted + covariates
+model_y_binary <- glm(
+  ecdi_track ~ ecoli + stunted + age_c + sex_f,
+  family  = binomial(link = "logit"),
+  weights = wt,
+  data    = df_cc
+)
+
+cat("--- Mediator model (stunted ~ ecoli) ---\n")
+print(summary(model_m_binary)$coefficients)
+cat("\n--- Outcome model (ecdi_track ~ ecoli + stunted) ---\n")
+print(summary(model_y_binary)$coefficients)
+
+## Clustered bootstrap mediation (boot = TRUE REQUIRED for cluster to apply)
+med_binary <- mediate(
+  model_m_binary, model_y_binary,
+  treat      = "ecoli",
+  mediator   = "stunted",
+  boot       = TRUE,
+  sims       = 1000,
+  cluster    = df_cc$psu
+)
+
+cat("\n--- Mediation results: Pathway A (binary stunting) ---\n")
+print(summary(med_binary))
+
+png("mediation_results/plots/pathway_A_binary_stunting.png",
+    width = 900, height = 700, res = 120)
+plot(med_binary, main = "E. coli -> Stunted -> ECDI (binary mediator)")
+dev.off()
+
+## =============================================================================
+## PATHWAY B: Continuous mediator (HAZ)
+## =============================================================================
+
+cat("\n\n=== PATHWAY B: E. coli -> HAZ (continuous) -> ECDI ===\n\n")
+
+## Mediator model: HAZ ~ E. coli + covariates (linear)
+model_m_cont <- lm(
+  haz ~ ecoli + age_c + sex_f,
+  weights = wt,
+  data    = df_cc
+)
+
+## Outcome model: P(ECDI on track) ~ E. coli + HAZ + covariates
+model_y_cont <- glm(
+  ecdi_track ~ ecoli + haz + age_c + sex_f,
+  family  = binomial(link = "logit"),
+  weights = wt,
+  data    = df_cc
+)
+
+cat("--- Mediator model (haz ~ ecoli) ---\n")
+print(summary(model_m_cont)$coefficients)
+cat("\n--- Outcome model (ecdi_track ~ ecoli + haz) ---\n")
+print(summary(model_y_cont)$coefficients)
+
+med_cont <- mediate(
+  model_m_cont, model_y_cont,
+  treat      = "ecoli",
+  mediator   = "haz",
+  boot       = TRUE,
+  sims       = 1000,
+  cluster    = df_cc$psu
+)
+
+cat("\n--- Mediation results: Pathway B (continuous HAZ) ---\n")
+print(summary(med_cont))
+
+png("mediation_results/plots/pathway_B_continuous_haz.png",
+    width = 900, height = 700, res = 120)
+plot(med_cont, main = "E. coli -> HAZ -> ECDI (continuous mediator)")
+dev.off()
+
+## =============================================================================
+## PATHWAY C/D: Underweight / WAZ (Z_SCORE_WEIGHT) as mediator
+## =============================================================================
+
+df_cc <- df_cc %>%
+  mutate(
+    underweight = as.numeric(Z_SCORE_WEIGHT < -2),
+    waz         = as.numeric(Z_SCORE_WEIGHT)
+  )
+
+cat("\n\n=== PATHWAY C: E. coli -> Underweight (binary WAZ) -> ECDI ===\n\n")
+
+model_m_uw_bin <- glm(underweight ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_uw_bin <- glm(ecdi_track ~ ecoli + underweight + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+
+med_uw_bin <- mediate(model_m_uw_bin, model_y_uw_bin, treat = "ecoli",
+                      mediator = "underweight", boot = TRUE, sims = 1000,
+                      cluster = df_cc$psu)
+cat("--- Mediation results: Pathway C (binary underweight) ---\n")
+print(summary(med_uw_bin))
+png("mediation_results/plots/pathway_C_binary_underweight.png", width = 900, height = 700, res = 120)
+plot(med_uw_bin, main = "E. coli -> Underweight -> ECDI (binary mediator)")
+dev.off()
+
+cat("\n\n=== PATHWAY D: E. coli -> WAZ (continuous) -> ECDI ===\n\n")
+
+model_m_waz <- lm(waz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_waz <- glm(ecdi_track ~ ecoli + waz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+
+med_waz <- mediate(model_m_waz, model_y_waz, treat = "ecoli", mediator = "waz",
+                   boot = TRUE, sims = 1000, cluster = df_cc$psu)
+cat("--- Mediation results: Pathway D (continuous WAZ) ---\n")
+print(summary(med_waz))
+png("mediation_results/plots/pathway_D_continuous_waz.png", width = 900, height = 700, res = 120)
+plot(med_waz, main = "E. coli -> WAZ -> ECDI (continuous mediator)")
+dev.off()
+
+## =============================================================================
+## PATHWAY E/F: Wasting / WHZ (Z_SCORE_HW) as mediator
+## =============================================================================
+
+df_cc <- df_cc %>%
+  mutate(
+    wasted = as.numeric(Z_SCORE_HW < -2),
+    whz    = as.numeric(Z_SCORE_HW)
+  )
+
+cat("\n\n=== PATHWAY E: E. coli -> Wasted (binary WHZ) -> ECDI ===\n\n")
+
+## Zero-cell check: wasting prevalence is low (~9%), so check before fitting
+cat("Zero-cell check (ecoli x wasted):", has_zero_cell(df_cc$ecoli, df_cc$wasted), "\n")
+
+model_m_ws_bin <- glm(wasted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_ws_bin <- glm(ecdi_track ~ ecoli + wasted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+
+med_ws_bin <- mediate(model_m_ws_bin, model_y_ws_bin, treat = "ecoli",
+                      mediator = "wasted", boot = TRUE, sims = 1000,
+                      cluster = df_cc$psu)
+cat("--- Mediation results: Pathway E (binary wasting) ---\n")
+print(summary(med_ws_bin))
+png("mediation_results/plots/pathway_E_binary_wasting.png", width = 900, height = 700, res = 120)
+plot(med_ws_bin, main = "E. coli -> Wasted -> ECDI (binary mediator)")
+dev.off()
+
+cat("\n\n=== PATHWAY F: E. coli -> WHZ (continuous) -> ECDI ===\n\n")
+
+model_m_whz <- lm(whz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_whz <- glm(ecdi_track ~ ecoli + whz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+
+med_whz <- mediate(model_m_whz, model_y_whz, treat = "ecoli", mediator = "whz",
+                   boot = TRUE, sims = 1000, cluster = df_cc$psu)
+cat("--- Mediation results: Pathway F (continuous WHZ) ---\n")
+print(summary(med_whz))
+png("mediation_results/plots/pathway_F_continuous_whz.png", width = 900, height = 700, res = 120)
+plot(med_whz, main = "E. coli -> WHZ -> ECDI (continuous mediator)")
+dev.off()
+
+## =============================================================================
+## PATHWAY G: JOINT multiple-mediator model (HAZ + WAZ + WHZ simultaneously)
+## =============================================================================
+## CAUTION: HAZ, WAZ, and WHZ are highly correlated in this sample
+## (pairwise r = 0.75-0.89). A joint parallel-mediator model is therefore prone
+## to severe multicollinearity: unstable coefficients, inflated standard errors,
+## and possible sign flips that do NOT reflect a genuine absence of an effect.
+## A VIF check is printed below -- treat any joint decomposition with substantial
+## caution if VIFs exceed ~5-10, and prefer the separate single-mediator
+## pathways (A-F above) as the primary reportable results.
+
+cat("\n\n=== PATHWAY G: Joint multi-mediator model (HAZ + WAZ + WHZ) ===\n\n")
+
+## Variance Inflation Factor check on the joint outcome model
+model_y_joint <- glm(
+  ecdi_track ~ ecoli + haz + waz + whz + age_c + sex_f,
+  family  = binomial(link = "logit"),
+  weights = wt,
+  data    = df_cc
+)
+
+vif_vals <- car::vif(model_y_joint)
+cat("--- VIF for joint outcome model (values > 5 indicate problematic collinearity) ---\n")
+print(vif_vals)
+
+## Mediator models (each mediator regressed on treatment + covariates)
+model_m_haz_j <- lm(haz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_m_waz_j <- lm(waz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_m_whz_j <- lm(whz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+
+set.seed(20260818)
+
+joint_med <- multimediate::multimediate(
+  lmodel.m = list(
+    model_m_haz_j,
+    model_m_waz_j,
+    model_m_whz_j
+  ),
+  model.y       = model_y_joint,
+  treat         = "ecoli",
+  correlated    = TRUE,
+  J             = 1000,
+  conf.level    = 0.95,
+  data          = df_cc,
+  verbose       = TRUE
+)
+
+summary(joint_med, opt = "avg")
+
+
+cat("\n--- Joint mediation results (HAZ + WAZ + WHZ simultaneously) ---\n")
+print(summary(joint_med))
+cat("\nNOTE: interpret joint indirect effects above alongside the VIF table.\n")
+cat("If VIFs are high, prefer pathways A-F (single mediator at a time) as the\n")
+cat("primary reportable results, and present Pathway G only as a robustness/\n")
+cat("exploratory check, not the headline finding.\n")
+
+## ---- 3. Consolidated results table -------------------------------------------
+extract_mediate_results <- function(med_obj, pathway_label) {
+  s <- summary(med_obj)
+  data.frame(
+    pathway          = pathway_label,
+    ACME_est         = as.numeric(s$d.avg),
+    ACME_ci_lower    = s$d.avg.ci[1],
+    ACME_ci_upper    = s$d.avg.ci[2],
+    ACME_p           = s$d.avg.p,
+    ADE_est          = as.numeric(s$z.avg),
+    ADE_ci_lower     = s$z.avg.ci[1],
+    ADE_ci_upper     = s$z.avg.ci[2],
+    ADE_p            = s$z.avg.p,
+    Total_effect_est = as.numeric(s$tau.coef),
+    Total_effect_p   = s$tau.p,
+    Prop_mediated    = as.numeric(s$n.avg),
+    Prop_mediated_p  = s$n.avg.p
+  )
+}
+
+results_table <- bind_rows(
+  extract_mediate_results(med_binary, "A: E.coli -> Stunted(binary HAZ) -> ECDI"),
+  extract_mediate_results(med_cont,   "B: E.coli -> HAZ(continuous) -> ECDI"),
+  extract_mediate_results(med_uw_bin, "C: E.coli -> Underweight(binary WAZ) -> ECDI"),
+  extract_mediate_results(med_waz,    "D: E.coli -> WAZ(continuous) -> ECDI"),
+  extract_mediate_results(med_ws_bin, "E: E.coli -> Wasted(binary WHZ) -> ECDI"),
+  extract_mediate_results(med_whz,    "F: E.coli -> WHZ(continuous) -> ECDI")
+)
+## Pathway G (joint multimediate) is reported separately via summary(joint_med)
+## since multimediate()'s output structure differs from single-mediator mediate()
+## objects and is not directly comparable in this table.
+
+print(results_table)
+
+write.csv(results_table, "mediation_results/gap3_mediation_results.csv", row.names = FALSE)
+saveRDS(list(model_m_binary = model_m_binary, model_y_binary = model_y_binary,
+             med_binary     = med_binary,
+             model_m_cont   = model_m_cont,   model_y_cont   = model_y_cont,
+             med_cont       = med_cont,
+             med_uw_bin     = med_uw_bin,     med_waz        = med_waz,
+             med_ws_bin     = med_ws_bin,     med_whz        = med_whz,
+             joint_med      = joint_med,      vif_vals       = vif_vals,
+             results_table  = results_table),
+        "mediation_results/gap3_mediation_objects.rds")
+
+cat("\n\n=== Gap 3 mediation analysis complete. ===\n")
+cat("Results saved to: mediation_results/gap3_mediation_results.csv\n")
+cat("Model objects saved to: mediation_results/gap3_mediation_objects.rds\n")
+cat("Diagnostic plots saved to: mediation_results/plots/\n")
+
+## ---- 4. Interpretation note ---------------------------------------------------
+## If ACME (average causal mediation effect) is not statistically distinguishable
+## from zero for either pathway, and the numerator/denominator of the proportion-
+## mediated statistic are both close to zero, this should be reported as a
+## well-powered null result -- consistent with Imai et al.'s guidance that the
+## proportion-mediated statistic is numerically unstable/uninterpretable near
+## zero effects, NOT indicative of a coding error. This is itself a legitimate
+## and reportable finding: it indicates E. coli's (null) association with ECDI in
+## this sample is not operating through a stunting/HAZ pathway.
+
+
+
+
+
+
+
+
+
+## =============================================================================
+## Gap 3 (subdomain version): E. coli -> Stunting/WAZ/WHZ -> ECDI SUBDOMAINS
+## Bangladesh MICS 2019
+##
+## Same structure as the original overall-ECDI mediation script (Pathways A-F),
+## just repeated once per subdomain outcome:
+##   ECDI_LNS, ECDI_PHY, ECDI_SEL, ECDI_LEARN
+## =============================================================================
+
+## ---- 0. Setup ---------------------------------------------------------------
+required_pkgs <- c("readxl", "survey", "mediation", "dplyr", "boot")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs) > 0) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+
+library(readxl)
+library(survey)
+library(mediation)
+library(dplyr)
+
+set.seed(20260818)
+
+dir.create("mediation_results_subdomains/plots", recursive = TRUE, showWarnings = FALSE)
+
+## ---- 1. Load & prepare data --------------------------------------------------
+df <- read_excel("mics_ecdi_dataset_v4.xlsx")
+
+df <- df %>%
+  mutate(
+    ecoli        = as.numeric(HH_DW_ECOLI),
+    stunted      = as.numeric(Z_SCORE_HEIGHT < -2),
+    haz          = as.numeric(Z_SCORE_HEIGHT),
+    underweight  = as.numeric(Z_SCORE_WEIGHT < -2),
+    waz          = as.numeric(Z_SCORE_WEIGHT),
+    wasted       = as.numeric(Z_SCORE_HW < -2),
+    whz          = as.numeric(Z_SCORE_HW),
+    age_c        = as.numeric(AGE_M) - 48,
+    sex_f        = factor(SEX),
+    psu          = as.factor(PSU),
+    stratum      = as.factor(STRATUM),
+    wt           = as.numeric(WEIGHT),
+    ecdi_lns     = as.numeric(ECDI_LNS),
+    ecdi_phy     = as.numeric(ECDI_PHY),
+    ecdi_sel     = as.numeric(ECDI_SEL),
+    ecdi_learn   = as.numeric(ECDI_LEARN)
+  )
+
+analysis_vars <- c("ecoli", "stunted", "haz", "underweight", "waz", "wasted", "whz",
+                   "age_c", "sex_f", "psu", "stratum", "wt",
+                   "ecdi_lns", "ecdi_phy", "ecdi_sel", "ecdi_learn")
+df_cc <- df[complete.cases(df[, analysis_vars]), ]
+
+cat("Analytic sample size:", nrow(df_cc), "\n\n")
+
+extract_mediate_results <- function(med_obj, pathway_label) {
+  s <- summary(med_obj)
+  data.frame(
+    pathway          = pathway_label,
+    ACME_est         = as.numeric(s$d.avg),
+    ACME_ci_lower    = s$d.avg.ci[1],
+    ACME_ci_upper    = s$d.avg.ci[2],
+    ACME_p           = s$d.avg.p,
+    ADE_est          = as.numeric(s$z.avg),
+    ADE_ci_lower     = s$z.avg.ci[1],
+    ADE_ci_upper     = s$z.avg.ci[2],
+    ADE_p            = s$z.avg.p,
+    Total_effect_est = as.numeric(s$tau.coef),
+    Total_effect_p   = s$tau.p,
+    Prop_mediated    = as.numeric(s$n.avg),
+    Prop_mediated_p  = s$n.avg.p
+  )
+}
+
+## =============================================================================
+## ================================ ECDI_LNS ===================================
+## =============================================================================
+cat("\n\n########## SUBDOMAIN: ECDI_LNS (Literacy-Numeracy) ##########\n\n")
+
+## --- Pathway A: Stunted (binary) ---
+model_m_binary <- glm(stunted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_binary <- glm(ecdi_lns ~ ecoli + stunted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_binary_lns <- mediate(model_m_binary, model_y_binary, treat = "ecoli",
+                          mediator = "stunted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_binary_lns))
+png("mediation_results_subdomains/plots/LNS_A_binary_stunting.png", width = 900, height = 700, res = 120)
+plot(med_binary_lns, main = "ECDI_LNS: E. coli -> Stunted -> LNS")
+dev.off()
+
+## --- Pathway B: HAZ (continuous) ---
+model_m_cont <- lm(haz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_cont <- glm(ecdi_lns ~ ecoli + haz + age_c + sex_f,
+                    family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_cont_lns <- mediate(model_m_cont, model_y_cont, treat = "ecoli",
+                        mediator = "haz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_cont_lns))
+png("mediation_results_subdomains/plots/LNS_B_continuous_haz.png", width = 900, height = 700, res = 120)
+plot(med_cont_lns, main = "ECDI_LNS: E. coli -> HAZ -> LNS")
+dev.off()
+
+## --- Pathway C: Underweight (binary) ---
+model_m_uw_bin <- glm(underweight ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_uw_bin <- glm(ecdi_lns ~ ecoli + underweight + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_uw_bin_lns <- mediate(model_m_uw_bin, model_y_uw_bin, treat = "ecoli",
+                          mediator = "underweight", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_uw_bin_lns))
+png("mediation_results_subdomains/plots/LNS_C_binary_underweight.png", width = 900, height = 700, res = 120)
+plot(med_uw_bin_lns, main = "ECDI_LNS: E. coli -> Underweight -> LNS")
+dev.off()
+
+## --- Pathway D: WAZ (continuous) ---
+model_m_waz <- lm(waz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_waz <- glm(ecdi_lns ~ ecoli + waz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_waz_lns <- mediate(model_m_waz, model_y_waz, treat = "ecoli",
+                       mediator = "waz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_waz_lns))
+png("mediation_results_subdomains/plots/LNS_D_continuous_waz.png", width = 900, height = 700, res = 120)
+plot(med_waz_lns, main = "ECDI_LNS: E. coli -> WAZ -> LNS")
+dev.off()
+
+## --- Pathway E: Wasted (binary) ---
+model_m_ws_bin <- glm(wasted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_ws_bin <- glm(ecdi_lns ~ ecoli + wasted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_ws_bin_lns <- mediate(model_m_ws_bin, model_y_ws_bin, treat = "ecoli",
+                          mediator = "wasted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_ws_bin_lns))
+png("mediation_results_subdomains/plots/LNS_E_binary_wasting.png", width = 900, height = 700, res = 120)
+plot(med_ws_bin_lns, main = "ECDI_LNS: E. coli -> Wasted -> LNS")
+dev.off()
+
+## --- Pathway F: WHZ (continuous) ---
+model_m_whz <- lm(whz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_whz <- glm(ecdi_lns ~ ecoli + whz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_whz_lns <- mediate(model_m_whz, model_y_whz, treat = "ecoli",
+                       mediator = "whz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_whz_lns))
+png("mediation_results_subdomains/plots/LNS_F_continuous_whz.png", width = 900, height = 700, res = 120)
+plot(med_whz_lns, main = "ECDI_LNS: E. coli -> WHZ -> LNS")
+dev.off()
+
+results_lns <- bind_rows(
+  extract_mediate_results(med_binary_lns, "LNS-A: Stunted(binary HAZ)"),
+  extract_mediate_results(med_cont_lns,   "LNS-B: HAZ(continuous)"),
+  extract_mediate_results(med_uw_bin_lns, "LNS-C: Underweight(binary WAZ)"),
+  extract_mediate_results(med_waz_lns,    "LNS-D: WAZ(continuous)"),
+  extract_mediate_results(med_ws_bin_lns, "LNS-E: Wasted(binary WHZ)"),
+  extract_mediate_results(med_whz_lns,    "LNS-F: WHZ(continuous)")
+)
+
+## =============================================================================
+## ================================ ECDI_PHY ===================================
+## =============================================================================
+cat("\n\n########## SUBDOMAIN: ECDI_PHY (Physical Development) ##########\n\n")
+cat("NOTE: ECDI_PHY is ~98% on-track in this sample -- watch for convergence\n")
+cat("warnings / unstable estimates below, consistent with the separation issue\n")
+cat("documented for this domain in the Gap 2 analysis.\n\n")
+
+model_m_binary <- glm(stunted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_binary <- glm(ecdi_phy ~ ecoli + stunted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_binary_phy <- mediate(model_m_binary, model_y_binary, treat = "ecoli",
+                          mediator = "stunted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_binary_phy))
+png("mediation_results_subdomains/plots/PHY_A_binary_stunting.png", width = 900, height = 700, res = 120)
+plot(med_binary_phy, main = "ECDI_PHY: E. coli -> Stunted -> PHY")
+dev.off()
+
+model_m_cont <- lm(haz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_cont <- glm(ecdi_phy ~ ecoli + haz + age_c + sex_f,
+                    family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_cont_phy <- mediate(model_m_cont, model_y_cont, treat = "ecoli",
+                        mediator = "haz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_cont_phy))
+png("mediation_results_subdomains/plots/PHY_B_continuous_haz.png", width = 900, height = 700, res = 120)
+plot(med_cont_phy, main = "ECDI_PHY: E. coli -> HAZ -> PHY")
+dev.off()
+
+model_m_uw_bin <- glm(underweight ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_uw_bin <- glm(ecdi_phy ~ ecoli + underweight + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_uw_bin_phy <- mediate(model_m_uw_bin, model_y_uw_bin, treat = "ecoli",
+                          mediator = "underweight", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_uw_bin_phy))
+png("mediation_results_subdomains/plots/PHY_C_binary_underweight.png", width = 900, height = 700, res = 120)
+plot(med_uw_bin_phy, main = "ECDI_PHY: E. coli -> Underweight -> PHY")
+dev.off()
+
+model_m_waz <- lm(waz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_waz <- glm(ecdi_phy ~ ecoli + waz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_waz_phy <- mediate(model_m_waz, model_y_waz, treat = "ecoli",
+                       mediator = "waz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_waz_phy))
+png("mediation_results_subdomains/plots/PHY_D_continuous_waz.png", width = 900, height = 700, res = 120)
+plot(med_waz_phy, main = "ECDI_PHY: E. coli -> WAZ -> PHY")
+dev.off()
+
+model_m_ws_bin <- glm(wasted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_ws_bin <- glm(ecdi_phy ~ ecoli + wasted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_ws_bin_phy <- mediate(model_m_ws_bin, model_y_ws_bin, treat = "ecoli",
+                          mediator = "wasted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_ws_bin_phy))
+png("mediation_results_subdomains/plots/PHY_E_binary_wasting.png", width = 900, height = 700, res = 120)
+plot(med_ws_bin_phy, main = "ECDI_PHY: E. coli -> Wasted -> PHY")
+dev.off()
+
+model_m_whz <- lm(whz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_whz <- glm(ecdi_phy ~ ecoli + whz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_whz_phy <- mediate(model_m_whz, model_y_whz, treat = "ecoli",
+                       mediator = "whz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_whz_phy))
+png("mediation_results_subdomains/plots/PHY_F_continuous_whz.png", width = 900, height = 700, res = 120)
+plot(med_whz_phy, main = "ECDI_PHY: E. coli -> WHZ -> PHY")
+dev.off()
+
+results_phy <- bind_rows(
+  extract_mediate_results(med_binary_phy, "PHY-A: Stunted(binary HAZ)"),
+  extract_mediate_results(med_cont_phy,   "PHY-B: HAZ(continuous)"),
+  extract_mediate_results(med_uw_bin_phy, "PHY-C: Underweight(binary WAZ)"),
+  extract_mediate_results(med_waz_phy,    "PHY-D: WAZ(continuous)"),
+  extract_mediate_results(med_ws_bin_phy, "PHY-E: Wasted(binary WHZ)"),
+  extract_mediate_results(med_whz_phy,    "PHY-F: WHZ(continuous)")
+)
+
+## =============================================================================
+## ================================ ECDI_SEL ===================================
+## =============================================================================
+cat("\n\n########## SUBDOMAIN: ECDI_SEL (Social-Emotional Development) ##########\n\n")
+
+model_m_binary <- glm(stunted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_binary <- glm(ecdi_sel ~ ecoli + stunted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_binary_sel <- mediate(model_m_binary, model_y_binary, treat = "ecoli",
+                          mediator = "stunted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_binary_sel))
+png("mediation_results_subdomains/plots/SEL_A_binary_stunting.png", width = 900, height = 700, res = 120)
+plot(med_binary_sel, main = "ECDI_SEL: E. coli -> Stunted -> SEL")
+dev.off()
+
+model_m_cont <- lm(haz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_cont <- glm(ecdi_sel ~ ecoli + haz + age_c + sex_f,
+                    family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_cont_sel <- mediate(model_m_cont, model_y_cont, treat = "ecoli",
+                        mediator = "haz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_cont_sel))
+png("mediation_results_subdomains/plots/SEL_B_continuous_haz.png", width = 900, height = 700, res = 120)
+plot(med_cont_sel, main = "ECDI_SEL: E. coli -> HAZ -> SEL")
+dev.off()
+
+model_m_uw_bin <- glm(underweight ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_uw_bin <- glm(ecdi_sel ~ ecoli + underweight + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_uw_bin_sel <- mediate(model_m_uw_bin, model_y_uw_bin, treat = "ecoli",
+                          mediator = "underweight", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_uw_bin_sel))
+png("mediation_results_subdomains/plots/SEL_C_binary_underweight.png", width = 900, height = 700, res = 120)
+plot(med_uw_bin_sel, main = "ECDI_SEL: E. coli -> Underweight -> SEL")
+dev.off()
+
+model_m_waz <- lm(waz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_waz <- glm(ecdi_sel ~ ecoli + waz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_waz_sel <- mediate(model_m_waz, model_y_waz, treat = "ecoli",
+                       mediator = "waz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_waz_sel))
+png("mediation_results_subdomains/plots/SEL_D_continuous_waz.png", width = 900, height = 700, res = 120)
+plot(med_waz_sel, main = "ECDI_SEL: E. coli -> WAZ -> SEL")
+dev.off()
+
+model_m_ws_bin <- glm(wasted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_ws_bin <- glm(ecdi_sel ~ ecoli + wasted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_ws_bin_sel <- mediate(model_m_ws_bin, model_y_ws_bin, treat = "ecoli",
+                          mediator = "wasted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_ws_bin_sel))
+png("mediation_results_subdomains/plots/SEL_E_binary_wasting.png", width = 900, height = 700, res = 120)
+plot(med_ws_bin_sel, main = "ECDI_SEL: E. coli -> Wasted -> SEL")
+dev.off()
+
+model_m_whz <- lm(whz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_whz <- glm(ecdi_sel ~ ecoli + whz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_whz_sel <- mediate(model_m_whz, model_y_whz, treat = "ecoli",
+                       mediator = "whz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_whz_sel))
+png("mediation_results_subdomains/plots/SEL_F_continuous_whz.png", width = 900, height = 700, res = 120)
+plot(med_whz_sel, main = "ECDI_SEL: E. coli -> WHZ -> SEL")
+dev.off()
+
+results_sel <- bind_rows(
+  extract_mediate_results(med_binary_sel, "SEL-A: Stunted(binary HAZ)"),
+  extract_mediate_results(med_cont_sel,   "SEL-B: HAZ(continuous)"),
+  extract_mediate_results(med_uw_bin_sel, "SEL-C: Underweight(binary WAZ)"),
+  extract_mediate_results(med_waz_sel,    "SEL-D: WAZ(continuous)"),
+  extract_mediate_results(med_ws_bin_sel, "SEL-E: Wasted(binary WHZ)"),
+  extract_mediate_results(med_whz_sel,    "SEL-F: WHZ(continuous)")
+)
+
+## =============================================================================
+## =============================== ECDI_LEARN ==================================
+## =============================================================================
+cat("\n\n########## SUBDOMAIN: ECDI_LEARN (Approaches to Learning) ##########\n\n")
+
+model_m_binary <- glm(stunted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_binary <- glm(ecdi_learn ~ ecoli + stunted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_binary_learn <- mediate(model_m_binary, model_y_binary, treat = "ecoli",
+                            mediator = "stunted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_binary_learn))
+png("mediation_results_subdomains/plots/LEARN_A_binary_stunting.png", width = 900, height = 700, res = 120)
+plot(med_binary_learn, main = "ECDI_LEARN: E. coli -> Stunted -> LEARN")
+dev.off()
+
+model_m_cont <- lm(haz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_cont <- glm(ecdi_learn ~ ecoli + haz + age_c + sex_f,
+                    family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_cont_learn <- mediate(model_m_cont, model_y_cont, treat = "ecoli",
+                          mediator = "haz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_cont_learn))
+png("mediation_results_subdomains/plots/LEARN_B_continuous_haz.png", width = 900, height = 700, res = 120)
+plot(med_cont_learn, main = "ECDI_LEARN: E. coli -> HAZ -> LEARN")
+dev.off()
+
+model_m_uw_bin <- glm(underweight ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_uw_bin <- glm(ecdi_learn ~ ecoli + underweight + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_uw_bin_learn <- mediate(model_m_uw_bin, model_y_uw_bin, treat = "ecoli",
+                            mediator = "underweight", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_uw_bin_learn))
+png("mediation_results_subdomains/plots/LEARN_C_binary_underweight.png", width = 900, height = 700, res = 120)
+plot(med_uw_bin_learn, main = "ECDI_LEARN: E. coli -> Underweight -> LEARN")
+dev.off()
+
+model_m_waz <- lm(waz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_waz <- glm(ecdi_learn ~ ecoli + waz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_waz_learn <- mediate(model_m_waz, model_y_waz, treat = "ecoli",
+                         mediator = "waz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_waz_learn))
+png("mediation_results_subdomains/plots/LEARN_D_continuous_waz.png", width = 900, height = 700, res = 120)
+plot(med_waz_learn, main = "ECDI_LEARN: E. coli -> WAZ -> LEARN")
+dev.off()
+
+model_m_ws_bin <- glm(wasted ~ ecoli + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+model_y_ws_bin <- glm(ecdi_learn ~ ecoli + wasted + age_c + sex_f,
+                      family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_ws_bin_learn <- mediate(model_m_ws_bin, model_y_ws_bin, treat = "ecoli",
+                            mediator = "wasted", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_ws_bin_learn))
+png("mediation_results_subdomains/plots/LEARN_E_binary_wasting.png", width = 900, height = 700, res = 120)
+plot(med_ws_bin_learn, main = "ECDI_LEARN: E. coli -> Wasted -> LEARN")
+dev.off()
+
+model_m_whz <- lm(whz ~ ecoli + age_c + sex_f, weights = wt, data = df_cc)
+model_y_whz <- glm(ecdi_learn ~ ecoli + whz + age_c + sex_f,
+                   family = binomial(link = "logit"), weights = wt, data = df_cc)
+med_whz_learn <- mediate(model_m_whz, model_y_whz, treat = "ecoli",
+                         mediator = "whz", boot = TRUE, sims = 1000, cluster = df_cc$psu)
+print(summary(med_whz_learn))
+png("mediation_results_subdomains/plots/LEARN_F_continuous_whz.png", width = 900, height = 700, res = 120)
+plot(med_whz_learn, main = "ECDI_LEARN: E. coli -> WHZ -> LEARN")
+dev.off()
+
+results_learn <- bind_rows(
+  extract_mediate_results(med_binary_learn, "LEARN-A: Stunted(binary HAZ)"),
+  extract_mediate_results(med_cont_learn,   "LEARN-B: HAZ(continuous)"),
+  extract_mediate_results(med_uw_bin_learn, "LEARN-C: Underweight(binary WAZ)"),
+  extract_mediate_results(med_waz_learn,    "LEARN-D: WAZ(continuous)"),
+  extract_mediate_results(med_ws_bin_learn, "LEARN-E: Wasted(binary WHZ)"),
+  extract_mediate_results(med_whz_learn,    "LEARN-F: WHZ(continuous)")
+)
+
+## ---- Consolidated results across all 4 subdomains -----------------------------
+results_table_all <- bind_rows(results_lns, results_phy, results_sel, results_learn)
+
+cat("\n\n=== CONSOLIDATED RESULTS: ALL 4 SUBDOMAINS ===\n")
+print(results_table_all)
+
+write.csv(results_table_all, "mediation_results_subdomains/gap3_subdomain_mediation_results.csv",
+          row.names = FALSE)
+
+saveRDS(
+  list(
+    LNS = list(med_binary_lns, med_cont_lns, med_uw_bin_lns, med_waz_lns, med_ws_bin_lns, med_whz_lns),
+    PHY = list(med_binary_phy, med_cont_phy, med_uw_bin_phy, med_waz_phy, med_ws_bin_phy, med_whz_phy),
+    SEL = list(med_binary_sel, med_cont_sel, med_uw_bin_sel, med_waz_sel, med_ws_bin_sel, med_whz_sel),
+    LEARN = list(med_binary_learn, med_cont_learn, med_uw_bin_learn, med_waz_learn, med_ws_bin_learn, med_whz_learn),
+    results_table_all = results_table_all
+  ),
+  "mediation_results_subdomains/gap3_subdomain_mediation_objects.rds"
+)
+
+cat("\n\nDone. Results: mediation_results_subdomains/gap3_subdomain_mediation_results.csv\n")

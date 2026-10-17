@@ -18,15 +18,7 @@ The code has been reorganized for reproducibility and further development.
 R, RStudio and the prepared dataset, mics_ecdi_dataset_v4.xlsx.
 
 # Run the analysis
-1. Open mics2019-ecdi.Rproj in RStudio.
-2. Place the dataset in data/private/.
-3. Run source("setup_packages.R") to install dependencies.
-4. Edit config.R to select analyses. For a first run, use analyses = c("overall").
-5. Run source("run_analysis.R").
-
-# Project structure
-- R/: Analysis scripts.
-- config.R: Data and analysis settings.
-- outputs/: Generated results.
-- docs/REVIEW_NOTES.md: Issues requiring review.
-Each run saves results in a separate folder inside outputs/.
+1. Keep the dataset in the targeted repository/ folder in the local computer
+2. Go to new R script in R studio and open new script
+3. paste the code in the script and run accrodingly
+4. Have fun
